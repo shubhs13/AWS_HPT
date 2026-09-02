@@ -6,5 +6,6 @@
 
 # STEP 2
 
- - Create a simple Glue job 
+ - Create a simple Glue job to seperate metadata and chargedata from original csv in s3 bronze
+ - Will do some more transformation on charge data before exporting clean data to silver 
 
