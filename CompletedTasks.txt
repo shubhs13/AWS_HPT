@@ -1,0 +1,19 @@
+1.Created AWS S3 Bronze bucket and stored raw MRF CSV.
+2.Created Glue IAM role with S3 read/write permissions.
+3.Created AWS Glue PySpark job bronze_to_silver_methodist.
+4.Configured Glue Spark 3.5 / Python 3 / G.1X workers.
+5.Successfully read the raw CSV from Bronze.
+6.Identified the 3-row MRF structure:
+    Row 1 → metadata headers
+    Row 2 → metadata values
+    Row 3 → charge headers
+    Row 4+ → charge records
+7.Extracted hospital metadata DataFrame.
+8.Extracted charge DataFrame.
+9.Preserved all charge fields initially as StringType.
+10.Validated 30 charge columns and 187,191 charge records.
+11.Fixed S3 IAM PATH_NOT_FOUND issue.
+12.Fixed CANNOT_DETERMINE_TYPE issue.
+13.Fixed None metadata column-name issue.
+14.Added Staging Parquet output paths for metadata and charges.
+15.Added code to write parsed data to Staging.
