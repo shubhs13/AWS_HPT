@@ -1,0 +1,198 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from awsglue.job import Job
+
+# --------------------------------------------------
+# Initialize Glue
+# --------------------------------------------------
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
+
+staging_path = "s3://htp-bronze-bucket/staging/Methodist/charge_data/"
+
+# --------------------------------------------------
+# Read Staging data
+# --------------------------------------------------
+
+charges_df = spark.read.parquet(staging_path)
+
+print("Staging record count:", charges_df.count())
+print("Staging column count:", len(charges_df.columns))
+
+# --------------------------------------------------
+# Filter CPT / HCPCS records
+# --------------------------------------------------
+
+silver_df = charges_df.filter(
+    col("code|2|type").isin("CPT", "HCPCS")
+)
+
+print("CPT/HCPCS eligible records:", silver_df.count())
+
+# --------------------------------------------------
+# Select Silver columns
+# --------------------------------------------------
+
+silver_columns = [
+    "description",
+    "code|2",
+    "code|2|type",
+    "setting",
+    "standard_charge|gross",
+    "standard_charge|discounted_cash",
+    "payer_name",
+    "plan_name",
+    "standard_charge|negotiated_dollar",
+    "standard_charge|negotiated_percentage",
+    "standard_charge|negotiated_algorithm",
+    "standard_charge|methodology",
+    "standard_charge|min",
+    "standard_charge|max"
+]
+
+silver_df = silver_df.select(silver_columns)
+
+print("Silver column count:", len(silver_df.columns))
+print("Silver records before casting:", silver_df.count())
+
+# --------------------------------------------------
+# Numeric columns
+# --------------------------------------------------
+
+numeric_columns = [
+    "standard_charge|gross",
+    "standard_charge|discounted_cash",
+    "standard_charge|negotiated_dollar",
+    "standard_charge|negotiated_percentage",
+    "standard_charge|min",
+    "standard_charge|max"
+]
+
+# --------------------------------------------------
+# Validate NULLs before casting
+# --------------------------------------------------
+
+print("NULL counts before casting:")
+
+for column_name in numeric_columns:
+    null_count = silver_df.filter(
+        col(column_name).isNull() | (col(column_name) == "")
+    ).count()
+
+    print(f"{column_name}: {null_count}")
+
+# --------------------------------------------------
+# Cast numeric columns
+# --------------------------------------------------
+
+for column_name in numeric_columns:
+    silver_df = silver_df.withColumn(
+        column_name,
+        col(column_name).cast(DecimalType(18, 2))
+    )
+
+# --------------------------------------------------
+# Validate NULLs after casting
+# --------------------------------------------------
+
+print("NULL counts after casting:")
+
+for column_name in numeric_columns:
+    null_count = silver_df.filter(
+        col(column_name).isNull()
+    ).count()
+
+    print(f"{column_name}: {null_count}")
+
+# --------------------------------------------------
+# Validate schema
+# --------------------------------------------------
+
+print("Silver schema after casting:")
+silver_df.printSchema()
+
+# --------------------------------------------------
+# Validate Min / Max relationship
+# --------------------------------------------------
+
+validation = silver_df.agg(
+    count("*").alias("total_records"),
+    sum(
+        when(
+            col("standard_charge|min") > col("standard_charge|max"),
+            1
+        ).otherwise(0)
+    ).alias("min_greater_than_max"),
+    min("standard_charge|min").alias("minimum_of_min"),
+    max("standard_charge|min").alias("maximum_of_min"),
+    min("standard_charge|max").alias("minimum_of_max"),
+    max("standard_charge|max").alias("maximum_of_max")
+).collect()[0]
+
+print("Min / Max validation:")
+print("Total Silver records:", validation["total_records"])
+print("Records where min > max:", validation["min_greater_than_max"])
+print("Minimum of min:", validation["minimum_of_min"])
+print("Maximum of min:", validation["maximum_of_min"])
+print("Minimum of max:", validation["minimum_of_max"])
+print("Maximum of max:", validation["maximum_of_max"])
+
+# --------------------------------------------------
+# Exact Deduplication Validation
+# --------------------------------------------------
+
+before_count = silver_df.count()
+
+# Remove exact duplicates across all Silver columns
+silver_deduped = silver_df.dropDuplicates()
+
+after_count = silver_deduped.count()
+
+removed_count = before_count - after_count
+
+# Count duplicate groups remaining after deduplication
+remaining_duplicate_groups = (
+    silver_deduped
+    .groupBy(silver_deduped.columns)
+    .count()
+    .filter(col("count") > 1)
+    .count()
+)
+
+print("Exact Deduplication Validation:")
+print("Records before deduplication:", before_count)
+print("Records after deduplication:", after_count)
+print("Records removed:", removed_count)
+print("Remaining duplicate groups:", remaining_duplicate_groups)
+
+# --------------------------------------------------
+# Write Silver Data
+# --------------------------------------------------
+
+silver_path = "s3://htp-bronze-bucket/silver/Methodist/"
+
+silver_deduped.write \
+    .mode("overwrite") \
+    .parquet(silver_path)
+
+print("Silver data written successfully.")
+print("Silver record count:", silver_deduped.count())
+print("Silver location:", silver_path)
+
+job.commit()
