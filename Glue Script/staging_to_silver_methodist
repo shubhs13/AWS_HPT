@@ -1,81 +1,138 @@
 import sys
-from awsglue.transforms import *
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
+
 from awsglue.context import GlueContext
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
 from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from pyspark.sql.types import DecimalType
 
-# --------------------------------------------------
-# Initialize Glue
-# --------------------------------------------------
 
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+# ============================================================
+# 1. Initialize Glue / Spark
+# ============================================================
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 
 job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+job.init("staging_to_silver_methodist", {})
 
-# --------------------------------------------------
-# Paths
-# --------------------------------------------------
+
+# ============================================================
+# 2. Paths
+# ============================================================
 
 staging_path = "s3://htp-bronze-bucket/staging/Methodist/charge_data/"
+silver_path = "s3://htp-bronze-bucket/silver/Methodist/"
 
-# --------------------------------------------------
-# Read Staging data
-# --------------------------------------------------
 
-charges_df = spark.read.parquet(staging_path)
+# ============================================================
+# 3. Read Staging data
+# ============================================================
 
-print("Staging record count:", charges_df.count())
-print("Staging column count:", len(charges_df.columns))
+staging_df = spark.read.parquet(staging_path)
 
-# --------------------------------------------------
-# Filter CPT / HCPCS records
-# --------------------------------------------------
+print("========================================")
+print("STAGING DATA")
+print("========================================")
 
-silver_df = charges_df.filter(
-    col("code|2|type").isin("CPT", "HCPCS")
+staging_count = staging_df.count()
+
+print(f"Staging records : {staging_count}")
+print(f"Staging columns : {len(staging_df.columns)}")
+
+
+# ============================================================
+# 4. Filter to CPT / HCPCS
+# ============================================================
+#
+# Business requirement:
+# Only CPT and HCPCS procedure records are required
+# for the MVP.
+#
+# ============================================================
+
+silver_df = staging_df.filter(
+    F.col("code|2|type").isin("CPT", "HCPCS")
 )
 
-print("CPT/HCPCS eligible records:", silver_df.count())
+eligible_count = silver_df.count()
 
-# --------------------------------------------------
-# Select Silver columns
-# --------------------------------------------------
+print("\n========================================")
+print("CPT / HCPCS FILTER")
+print("========================================")
+
+print(f"Eligible records : {eligible_count}")
+print(f"Excluded records : {staging_count - eligible_count}")
+
+
+# ============================================================
+# 5. Select Silver columns
+# ============================================================
+#
+# IMPORTANT:
+# Code 1, Code 2, Code 3 and Code 4 are retained because
+# Gold grain validation showed that these source-level
+# identifiers are required to uniquely distinguish reported
+# pricing observations in this MRF.
+#
+# Pricing fields are retained separately as attributes.
+#
+# ============================================================
 
 silver_columns = [
-    "description",
+
+    # Source / procedure identifiers
+    "code|1",
+    "code|1|type",
+
     "code|2",
     "code|2|type",
+
+    "code|3",
+    "code|3|type",
+
+    "code|4",
+    "code|4|type",
+
+    # Procedure description
+    "description",
+
+    # Healthcare setting
     "setting",
+
+    # Pricing
     "standard_charge|gross",
     "standard_charge|discounted_cash",
-    "payer_name",
-    "plan_name",
+
     "standard_charge|negotiated_dollar",
     "standard_charge|negotiated_percentage",
     "standard_charge|negotiated_algorithm",
-    "standard_charge|methodology",
+
     "standard_charge|min",
-    "standard_charge|max"
+    "standard_charge|max",
+
+    "standard_charge|methodology",
+
+    # Payer / plan
+    "payer_name",
+    "plan_name"
 ]
 
-silver_df = silver_df.select(silver_columns)
 
-print("Silver column count:", len(silver_df.columns))
-print("Silver records before casting:", silver_df.count())
+silver_df = silver_df.select(
+    *silver_columns
+)
 
-# --------------------------------------------------
-# Numeric columns
-# --------------------------------------------------
 
-numeric_columns = [
+# ============================================================
+# 6. Cast pricing fields to Decimal
+# ============================================================
+
+decimal_type = DecimalType(18, 2)
+
+decimal_columns = [
     "standard_charge|gross",
     "standard_charge|discounted_cash",
     "standard_charge|negotiated_dollar",
@@ -84,115 +141,191 @@ numeric_columns = [
     "standard_charge|max"
 ]
 
-# --------------------------------------------------
-# Validate NULLs before casting
-# --------------------------------------------------
 
-print("NULL counts before casting:")
+for column_name in decimal_columns:
 
-for column_name in numeric_columns:
-    null_count = silver_df.filter(
-        col(column_name).isNull() | (col(column_name) == "")
-    ).count()
-
-    print(f"{column_name}: {null_count}")
-
-# --------------------------------------------------
-# Cast numeric columns
-# --------------------------------------------------
-
-for column_name in numeric_columns:
     silver_df = silver_df.withColumn(
         column_name,
-        col(column_name).cast(DecimalType(18, 2))
+        F.col(column_name).cast(decimal_type)
     )
 
-# --------------------------------------------------
-# Validate NULLs after casting
-# --------------------------------------------------
 
-print("NULL counts after casting:")
+# ============================================================
+# 7. Validate Silver record count before deduplication
+# ============================================================
 
-for column_name in numeric_columns:
-    null_count = silver_df.filter(
-        col(column_name).isNull()
-    ).count()
+before_dedup_count = silver_df.count()
 
-    print(f"{column_name}: {null_count}")
+print("\n========================================")
+print("SILVER BEFORE DEDUPLICATION")
+print("========================================")
 
-# --------------------------------------------------
-# Validate schema
-# --------------------------------------------------
+print(f"Records : {before_dedup_count}")
 
-print("Silver schema after casting:")
-silver_df.printSchema()
 
-# --------------------------------------------------
-# Validate Min / Max relationship
-# --------------------------------------------------
+# ============================================================
+# 8. Remove exact duplicate records
+# ============================================================
+#
+# We remove only completely identical records.
+#
+# We DO NOT deduplicate based on the Gold grain.
+# Different pricing observations must be preserved.
+#
+# ============================================================
 
-validation = silver_df.agg(
-    count("*").alias("total_records"),
-    sum(
-        when(
-            col("standard_charge|min") > col("standard_charge|max"),
-            1
-        ).otherwise(0)
-    ).alias("min_greater_than_max"),
-    min("standard_charge|min").alias("minimum_of_min"),
-    max("standard_charge|min").alias("maximum_of_min"),
-    min("standard_charge|max").alias("minimum_of_max"),
-    max("standard_charge|max").alias("maximum_of_max")
-).collect()[0]
-
-print("Min / Max validation:")
-print("Total Silver records:", validation["total_records"])
-print("Records where min > max:", validation["min_greater_than_max"])
-print("Minimum of min:", validation["minimum_of_min"])
-print("Maximum of min:", validation["maximum_of_min"])
-print("Minimum of max:", validation["minimum_of_max"])
-print("Maximum of max:", validation["maximum_of_max"])
-
-# --------------------------------------------------
-# Exact Deduplication Validation
-# --------------------------------------------------
-
-before_count = silver_df.count()
-
-# Remove exact duplicates across all Silver columns
 silver_deduped = silver_df.dropDuplicates()
 
-after_count = silver_deduped.count()
+after_dedup_count = silver_deduped.count()
 
-removed_count = before_count - after_count
+removed_count = before_dedup_count - after_dedup_count
 
-# Count duplicate groups remaining after deduplication
-remaining_duplicate_groups = (
+
+print("\n========================================")
+print("SILVER DEDUPLICATION")
+print("========================================")
+
+print(f"Before deduplication : {before_dedup_count}")
+print(f"After deduplication  : {after_dedup_count}")
+print(f"Exact duplicates removed : {removed_count}")
+
+
+# ============================================================
+# 9. Validate Gold grain on final Silver
+# ============================================================
+#
+# This is the grain validated previously against Staging.
+#
+# Expected:
+# Duplicate grain groups = 0
+#
+# ============================================================
+
+gold_grain_columns = [
+
+    "code|1",
+    "code|1|type",
+
+    "code|2",
+    "code|2|type",
+
+    "code|3",
+    "code|3|type",
+
+    "code|4",
+    "code|4|type",
+
+    "setting",
+    "payer_name",
+    "plan_name"
+]
+
+
+grain_counts = (
     silver_deduped
-    .groupBy(silver_deduped.columns)
-    .count()
-    .filter(col("count") > 1)
+    .groupBy(gold_grain_columns)
     .count()
 )
 
-print("Exact Deduplication Validation:")
-print("Records before deduplication:", before_count)
-print("Records after deduplication:", after_count)
-print("Records removed:", removed_count)
-print("Remaining duplicate groups:", remaining_duplicate_groups)
 
-# --------------------------------------------------
-# Write Silver Data
-# --------------------------------------------------
+duplicate_groups = (
+    grain_counts
+    .filter(F.col("count") > 1)
+)
 
-silver_path = "s3://htp-bronze-bucket/silver/Methodist/"
+duplicate_group_count = duplicate_groups.count()
+
+
+duplicate_record_count = (
+    duplicate_groups
+    .select(
+        F.sum(F.col("count") - 1).alias("duplicate_records")
+    )
+    .collect()[0]["duplicate_records"]
+)
+
+if duplicate_record_count is None:
+    duplicate_record_count = 0
+
+
+print("\n========================================")
+print("GOLD GRAIN VALIDATION ON SILVER")
+print("========================================")
+
+print(f"Duplicate grain groups : {duplicate_group_count}")
+print(
+    f"Duplicate records beyond first : "
+    f"{duplicate_record_count}"
+)
+
+
+if duplicate_group_count == 0:
+
+    print("GOLD GRAIN IS UNIQUE")
+
+else:
+
+    print("WARNING: GOLD GRAIN IS NOT UNIQUE")
+
+    duplicate_groups.orderBy(
+        F.desc("count")
+    ).show(
+        50,
+        truncate=False
+    )
+
+
+# ============================================================
+# 10. Basic Silver pricing validation
+# ============================================================
+
+print("\n========================================")
+print("SILVER PRICING VALIDATION")
+print("========================================")
+
+for column_name in decimal_columns:
+
+    null_count = (
+        silver_deduped
+        .filter(F.col(column_name).isNull())
+        .count()
+    )
+
+    print(
+        f"{column_name} null count : {null_count}"
+    )
+
+
+# ============================================================
+# 11. Final Silver schema
+# ============================================================
+
+print("\n========================================")
+print("FINAL SILVER SCHEMA")
+print("========================================")
+
+silver_deduped.printSchema()
+
+
+# ============================================================
+# 12. Write Silver Parquet
+# ============================================================
 
 silver_deduped.write \
     .mode("overwrite") \
     .parquet(silver_path)
 
-print("Silver data written successfully.")
-print("Silver record count:", silver_deduped.count())
-print("Silver location:", silver_path)
+
+print("\n========================================")
+print("SILVER WRITE COMPLETE")
+print("========================================")
+
+print(f"Silver path : {silver_path}")
+print(f"Final Silver records : {after_dedup_count}")
+
+
+# ============================================================
+# 13. Commit Glue job
+# ============================================================
 
 job.commit()
